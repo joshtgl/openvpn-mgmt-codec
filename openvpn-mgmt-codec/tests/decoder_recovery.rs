@@ -294,6 +294,25 @@ fn partial_client_notification_then_complete() {
 }
 
 // ---  ---
+// Line length limit
+// ---  ---
+
+#[test]
+fn overlong_line_errors_then_next_message_decodes() {
+    let mut c = codec().with_max_line_length(AccumulationLimit::Max(32));
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(&[b'x'; 64]);
+
+    // No newline yet, but already over the limit.
+    assert!(c.decode(&mut buf).is_err());
+
+    // The rest of the overlong line is discarded up to its newline.
+    buf.extend_from_slice(b"xxxx\nSUCCESS: recovered\n");
+    let msg = c.decode(&mut buf).unwrap().unwrap();
+    assert!(matches!(msg, OvpnMessage::Success(s) if s == "recovered"));
+}
+
+// ---  ---
 // Stress: alternating errors and valid messages
 // ---  ---
 

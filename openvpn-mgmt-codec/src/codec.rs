@@ -122,6 +122,16 @@ impl OvpnCodec {
         self
     }
 
+    /// Set the maximum length of a single line in bytes, excluding the
+    /// newline, before the decoder returns an error. Defaults to
+    /// [`DEFAULT_MAX_LINE_LENGTH`](openvpn_mgmt_frame::DEFAULT_MAX_LINE_LENGTH)
+    /// (1 MiB). The rest of an overlong line is discarded and decoding
+    /// resumes with the next one.
+    pub fn with_max_line_length(mut self, limit: AccumulationLimit) -> Self {
+        self.frame_decoder = self.frame_decoder.with_max_line_length(limit);
+        self
+    }
+
     /// Set the encoder mode for handling unsafe characters in user-supplied
     /// strings.
     ///

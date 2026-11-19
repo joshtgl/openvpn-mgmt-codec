@@ -61,7 +61,7 @@ mod decoder;
 mod encoder;
 mod frame;
 
-pub use decoder::FrameDecoder;
+pub use decoder::{DEFAULT_MAX_LINE_LENGTH, FrameDecoder};
 pub use encoder::{
     AccumulationLimit, EncodeError, EncoderMode, escape, quote, wire_safe, write_block, write_line,
 };

@@ -14,6 +14,11 @@ use crate::frame::Frame;
 /// interactive prompt).
 const PW_PROMPT: &[u8] = b"ENTER PASSWORD:";
 
+/// Default for [`FrameDecoder::with_max_line_length`]: far longer than any
+/// real management-interface line, but bounds memory if the peer never
+/// sends a newline.
+pub const DEFAULT_MAX_LINE_LENGTH: usize = 1024 * 1024;
+
 /// Internal accumulator for `>CLIENT:` ENV blocks.
 #[derive(Debug)]
 struct ClientEnvAccumulator {
@@ -55,6 +60,16 @@ pub struct FrameDecoder {
     /// Maximum ENV entries.
     max_client_env_entries: AccumulationLimit,
 
+    /// Maximum bytes in one line, excluding the newline.
+    max_line_length: AccumulationLimit,
+
+    /// Bytes at the start of the buffer already searched for a newline, so
+    /// a long partial line is not re-scanned on every read.
+    scanned: usize,
+
+    /// Dropping the remainder of a line that exceeded `max_line_length`.
+    discarding: bool,
+
     /// Whether the initial `>INFO:` banner has been seen.
     seen_info: bool,
 }
@@ -64,6 +79,9 @@ impl Default for FrameDecoder {
         Self {
             client_notification: None,
             max_client_env_entries: AccumulationLimit::Unlimited,
+            max_line_length: AccumulationLimit::Max(DEFAULT_MAX_LINE_LENGTH),
+            scanned: 0,
+            discarding: false,
             seen_info: false,
         }
     }
@@ -79,6 +97,23 @@ impl FrameDecoder {
     pub fn with_max_client_env_entries(mut self, limit: AccumulationLimit) -> Self {
         self.max_client_env_entries = limit;
         self
+    }
+
+    /// Set the maximum length of a single line in bytes, excluding the
+    /// newline. Defaults to [`DEFAULT_MAX_LINE_LENGTH`].
+    ///
+    /// A longer line makes [`decode`](Decoder::decode) return an
+    /// [`io::ErrorKind::InvalidData`] error; the rest of that line is
+    /// discarded and decoding resumes with the next one.
+    pub fn with_max_line_length(mut self, limit: AccumulationLimit) -> Self {
+        self.max_line_length = limit;
+        self
+    }
+
+    /// Error for an overlong line; resets state the line may have been part of.
+    fn line_too_long(&mut self, max: usize) -> io::Error {
+        self.client_notification = None;
+        io::Error::new(io::ErrorKind::InvalidData, LineTooLong { max })
     }
 }
 
@@ -102,14 +137,35 @@ struct AccumulationLimitExceeded {
     max: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("line exceeds maximum length ({max} bytes)")]
+struct LineTooLong {
+    max: usize,
+}
+
 impl Decoder for FrameDecoder {
     type Item = Frame;
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         loop {
-            // Find the next complete line.
-            let Some(newline_pos) = src.iter().position(|&b| b == b'\n') else {
+            // Drop the rest of an overlong line, up to and including its newline.
+            if self.discarding {
+                let Some(pos) = src.iter().position(|&b| b == b'\n') else {
+                    src.clear();
+                    return Ok(None);
+                };
+                src.advance(pos + 1);
+                self.discarding = false;
+            }
+
+            // Find the next complete line, resuming where the last call stopped.
+            let start = self.scanned.min(src.len());
+            let Some(newline_pos) = src[start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|pos| start + pos)
+            else {
                 // No complete line. Check for password prompt without
                 // trailing newline (OpenVPN >= 2.6).
                 if src.starts_with(PW_PROMPT) {
@@ -118,13 +174,31 @@ impl Decoder for FrameDecoder {
                         consume += 1;
                     }
                     src.advance(consume);
+                    self.scanned = 0;
                     return Ok(Some(Frame::PasswordPrompt));
                 }
+                if let AccumulationLimit::Max(max) = self.max_line_length
+                    && src.len() > max
+                {
+                    src.clear();
+                    self.scanned = 0;
+                    self.discarding = true;
+                    return Err(self.line_too_long(max));
+                }
+                self.scanned = src.len();
                 if src.capacity() - src.len() < 256 {
                     src.reserve(256);
                 }
                 return Ok(None);
             };
+            self.scanned = 0;
+
+            if let AccumulationLimit::Max(max) = self.max_line_length
+                && newline_pos > max
+            {
+                src.advance(newline_pos + 1);
+                return Err(self.line_too_long(max));
+            }
 
             // Extract and decode the line.
             let line_bytes = src.split_to(newline_pos + 1);
@@ -584,5 +658,99 @@ mod tests {
         let frame = decoder.decode(&mut buf).unwrap().unwrap();
         assert_eq!(frame, Frame::PasswordPrompt);
         assert!(buf.is_empty()); // CR consumed
+    }
+
+    // --- Line length limit ---
+
+    fn limited(max: usize) -> FrameDecoder {
+        FrameDecoder::new().with_max_line_length(AccumulationLimit::Max(max))
+    }
+
+    #[test]
+    fn line_at_limit_decodes() {
+        let mut decoder = limited(5);
+        let mut buf = BytesMut::from("ABCDE\n");
+        assert_eq!(
+            decoder.decode(&mut buf).unwrap(),
+            Some(Frame::Line("ABCDE".to_string()))
+        );
+    }
+
+    #[test]
+    fn partial_line_over_limit_errors_and_discards_rest() {
+        let mut decoder = limited(12);
+        let mut buf = BytesMut::from("ABCDEFGHIJKLM");
+        let err = decoder.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("maximum length"));
+        assert!(buf.is_empty());
+
+        // The tail of the overlong line is dropped; the next line decodes.
+        buf.extend_from_slice(b"HIJKLMNOP\nSUCCESS: ok\n");
+        assert_eq!(
+            decoder.decode(&mut buf).unwrap(),
+            Some(Frame::Success("ok".to_string()))
+        );
+    }
+
+    #[test]
+    fn complete_line_over_limit_errors_then_recovers() {
+        let mut decoder = limited(12);
+        let mut buf = BytesMut::from("ABCDEFGHIJKLM\nSUCCESS: ok\n");
+        assert!(decoder.decode(&mut buf).is_err());
+        assert_eq!(
+            decoder.decode(&mut buf).unwrap(),
+            Some(Frame::Success("ok".to_string()))
+        );
+    }
+
+    #[test]
+    fn overlong_line_resets_client_accumulation() {
+        let mut decoder = limited(20);
+        let mut buf = BytesMut::from(">CLIENT:CONNECT,1,0\n>CLIENT:ENV,x=0123456789012345\n");
+        assert!(decoder.decode(&mut buf).is_err());
+        assert!(decoder.client_notification.is_none());
+        buf.extend_from_slice(b"SUCCESS: ok\n");
+        assert_eq!(
+            decoder.decode(&mut buf).unwrap(),
+            Some(Frame::Success("ok".to_string()))
+        );
+    }
+
+    #[test]
+    fn default_limit_applies() {
+        let mut decoder = FrameDecoder::new();
+        let mut buf = BytesMut::from(&vec![b'x'; DEFAULT_MAX_LINE_LENGTH + 1][..]);
+        assert!(decoder.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn unlimited_accepts_long_lines() {
+        let mut decoder = FrameDecoder::new().with_max_line_length(AccumulationLimit::Unlimited);
+        let mut buf = BytesMut::from(&vec![b'x'; DEFAULT_MAX_LINE_LENGTH + 1][..]);
+        assert_eq!(decoder.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b"\n");
+        assert!(matches!(
+            decoder.decode(&mut buf).unwrap(),
+            Some(Frame::Line(_))
+        ));
+    }
+
+    #[test]
+    fn line_split_across_reads_decodes() {
+        let mut decoder = limited(64);
+        let mut buf = BytesMut::from("SUCC");
+        assert_eq!(decoder.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b"ESS: split");
+        assert_eq!(decoder.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b"\n>STATE:1,CONNECTED,SUCCESS\n");
+        assert_eq!(
+            decoder.decode(&mut buf).unwrap(),
+            Some(Frame::Success("split".to_string()))
+        );
+        assert!(matches!(
+            decoder.decode(&mut buf).unwrap(),
+            Some(Frame::Notification { ref kind, .. }) if kind == "STATE"
+        ));
     }
 }
